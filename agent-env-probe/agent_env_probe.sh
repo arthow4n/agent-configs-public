@@ -9,7 +9,7 @@
 set -u
 set -o pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -178,6 +178,51 @@ pids_limit_v2() {
   [ -r /sys/fs/cgroup/pids.current ] && kv "cgroup pids.current" "$(read_file_line /sys/fs/cgroup/pids.current)"
 }
 
+effective_cpu_threads() {
+  local n=1 q p quota
+  if have nproc; then n=$(nproc 2>/dev/null || echo 1); fi
+  printf '%s' "$n" | grep -Eq '^[0-9]+$' || n=1
+  [ "$n" -ge 1 ] 2>/dev/null || n=1
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null || true
+    if printf '%s' "${q:-}" | grep -Eq '^[0-9]+$' && printf '%s' "${p:-}" | grep -Eq '^[0-9]+$' && [ "$p" -gt 0 ]; then
+      quota=$(( (q + p - 1) / p ))
+      [ "$quota" -ge 1 ] || quota=1
+      [ "$quota" -lt "$n" ] && n="$quota"
+    fi
+  fi
+  printf '%s' "$n"
+}
+
+cpu_isa_inventory() {
+  local arch flags="" feature found=""
+  arch=$(uname -m 2>/dev/null || echo unknown)
+  if have lscpu; then
+    flags=$(lscpu 2>/dev/null | awk -F: '/^(Flags|Features):/ {sub(/^[ \t]+/,"",$2); print $2; exit}' || true)
+  fi
+  if [ -z "$flags" ] && [ -r /proc/cpuinfo ]; then
+    flags=$(awk -F: '/^(flags|Features)[[:space:]]*:/ {sub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+  fi
+
+  case "$arch" in
+    x86_64|amd64|i?86)
+      for feature in sse4_2 avx avx2 avx512f avx512bw avx512vl fma aes sha_ni amx_tile amx_int8 amx_bf16; do
+        if printf ' %s ' "$flags" | grep -Fq " $feature "; then
+          found="${found}${found:+,}$feature"
+        fi
+      done
+      ;;
+    aarch64|arm64|arm*)
+      for feature in asimd fp16 sve sve2 aes sha1 sha2 crc32; do
+        if printf ' %s ' "$flags" | grep -Fq " $feature "; then
+          found="${found}${found:+,}$feature"
+        fi
+      done
+      ;;
+  esac
+  kv "CPU ISA highlights" "${found:-none/hidden}"
+}
+
 bounded() {
   local secs=$1
   shift
@@ -315,6 +360,284 @@ EOF_C
     kv "gcc test cleanup" "FAIL"
   fi
 }
+
+python_ml_inventory() {
+  section "ML / NUMERICAL STACK"
+  local py="" mod dist label out rc minpath
+  if have python3; then py=$(command -v python3); elif have python; then py=$(command -v python); fi
+  [ -n "$py" ] || { kv "ml.python" "SKIP: Python absent"; return; }
+  minpath="$(dirname "$py"):/usr/local/bin:/usr/bin:/bin"
+
+  while IFS='|' read -r mod dist label; do
+    [ -n "$mod" ] || continue
+    out=$(bounded 10 env PATH="$minpath" LANG=C HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false TF_CPP_MIN_LOG_LEVEL=3 \
+      "$py" -I -c '
+import importlib, importlib.metadata as md, sys
+mod, dist = sys.argv[1], sys.argv[2]
+m = importlib.import_module(mod)
+v = getattr(m, "__version__", None)
+if v is None:
+    try:
+        v = md.version(dist)
+    except Exception:
+        v = "present"
+print(str(v))
+' "$mod" "$dist" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+      kv "ml.$label" "$(printf '%s' "$out" | sed -n '1p' | cut -c1-180)"
+    elif [ "$rc" -eq 124 ]; then
+      kv "ml.$label" "BLOCKED/TIMEOUT"
+    else
+      kv "ml.$label" "absent/unavailable"
+    fi
+  done <<'EOF_ML_MODULES'
+numpy|numpy|numpy
+scipy|scipy|scipy
+sklearn|scikit-learn|sklearn
+torch|torch|torch
+tensorflow|tensorflow|tensorflow
+jax|jax|jax
+transformers|transformers|transformers
+tokenizers|tokenizers|tokenizers
+onnx|onnx|onnx
+onnxruntime|onnxruntime|onnxruntime
+accelerate|accelerate|accelerate
+sentence_transformers|sentence-transformers|sentence_transformers
+EOF_ML_MODULES
+
+  out=$(bounded 8 "$py" -I -c '
+import contextlib, io, re
+import numpy as np
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    np.show_config()
+text = buf.getvalue().lower()
+names = []
+for name in ("mkl", "openblas", "blis", "accelerate", "flexiblas", "netlib"):
+    if name in text and name not in names:
+        names.append(name)
+print(",".join(names) or "unknown")
+' 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "numpy BLAS backend" "${out:-unknown}" || kv "numpy BLAS backend" "unavailable"
+
+  out=$(bounded 10 "$py" -I -c 'import jax; print(jax.default_backend())' 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$out" ] && kv "jax default backend" "$(printf '%s' "$out" | sed -n '1p')" || true
+
+  out=$(bounded 10 env TF_CPP_MIN_LOG_LEVEL=3 "$py" -I -c 'import tensorflow as tf; print(len(tf.config.list_physical_devices("GPU")))' 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$out" ] && kv "tensorflow GPU devices" "$(printf '%s' "$out" | sed -n '1p')" || true
+
+  out=$(bounded 8 "$py" -I -c 'import onnxruntime as ort; print(",".join(ort.get_available_providers()))' 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$out" ] && kv "onnxruntime providers" "$(printf '%s' "$out" | sed -n '1p' | cut -c1-180)" || true
+}
+
+cpu_ml_benchmark() {
+  section "CPU NUMERICAL / ML TEST"
+  local py="" threads out rc minpath
+  if have python3; then py=$(command -v python3); elif have python; then py=$(command -v python); fi
+  [ -n "$py" ] || { kv "cpu.numpy_matmul" "SKIP: Python absent"; kv "torch.cpu_execution" "SKIP: Python absent"; return; }
+  minpath="$(dirname "$py"):/usr/local/bin:/usr/bin:/bin"
+  threads=$(effective_cpu_threads)
+  kv "cpu.numeric_threads" "$threads"
+
+  out=$(bounded 20 env PATH="$minpath" LANG=C \
+    OMP_NUM_THREADS="$threads" OPENBLAS_NUM_THREADS="$threads" MKL_NUM_THREADS="$threads" \
+    BLIS_NUM_THREADS="$threads" VECLIB_MAXIMUM_THREADS="$threads" NUMEXPR_NUM_THREADS="$threads" \
+    "$py" -I -c '
+import statistics, time
+import numpy as np
+n = 1024
+a = np.ones((n, n), dtype=np.float32)
+b = np.ones((n, n), dtype=np.float32)
+_ = a @ b
+times = []
+for _ in range(3):
+    t0 = time.perf_counter()
+    c = a @ b
+    times.append(time.perf_counter() - t0)
+if float(c[0, 0]) != float(n):
+    raise SystemExit(2)
+med = statistics.median(times)
+gflops = (2.0 * n * n * n) / med / 1e9
+print(f"{med*1000:.3f}|{gflops:.2f}")
+' 2>/dev/null)
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '|'; then
+    kv "cpu.numpy_matmul_1024_f32_ms" "$(printf '%s' "$out" | cut -d'|' -f1)"
+    kv "cpu.numpy_matmul_1024_GFLOPs" "$(printf '%s' "$out" | cut -d'|' -f2)"
+  elif [ "$rc" -eq 124 ]; then
+    kv "cpu.numpy_matmul" "BLOCKED/TIMEOUT"
+  else
+    kv "cpu.numpy_matmul" "SKIP/FAIL: NumPy unavailable or execution failed (exit $rc)"
+  fi
+
+  bounded 12 env PATH="$minpath" LANG=C OMP_NUM_THREADS="$threads" MKL_NUM_THREADS="$threads" \
+    "$py" -I -c '
+import torch
+torch.set_grad_enabled(False)
+try:
+    torch.set_num_threads(int(__import__("os").environ.get("OMP_NUM_THREADS", "1")))
+except Exception:
+    pass
+a = torch.ones((256, 256), dtype=torch.float32)
+c = a @ a
+raise SystemExit(0 if float(c[0, 0]) == 256.0 else 2)
+' >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "torch.cpu_execution" "PASS" || kv "torch.cpu_execution" "SKIP/FAIL (exit $rc)"
+}
+
+gpu_ml_capability_test() {
+  section "GPU / ML CAPABILITY AND EXECUTION"
+  local py="" out rc
+  if have python3; then py=$(command -v python3); elif have python; then py=$(command -v python); fi
+  [ -n "$py" ] || { kv "torch GPU probe" "SKIP: Python absent"; return; }
+
+  out=$(bounded 30 env LANG=C PYTORCH_ENABLE_MPS_FALLBACK=0 "$py" -I -c '
+import statistics, time
+try:
+    import torch
+except Exception:
+    raise SystemExit(10)
+
+def emit(k, v):
+    print(f"{k}|{v}")
+
+emit("torch_version", getattr(torch, "__version__", "unknown"))
+emit("torch_cuda_build", getattr(torch.version, "cuda", None) or "none")
+emit("torch_hip_build", getattr(torch.version, "hip", None) or "none")
+
+backend = None
+device = None
+sync = lambda: None
+
+cuda_ok = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
+mps_ok = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+xpu_ok = bool(hasattr(torch, "xpu") and torch.xpu.is_available())
+
+emit("torch_cuda_available", str(cuda_ok).lower())
+emit("torch_mps_available", str(mps_ok).lower())
+emit("torch_xpu_available", str(xpu_ok).lower())
+
+if cuda_ok:
+    backend = "rocm" if getattr(torch.version, "hip", None) else "cuda"
+    device = torch.device("cuda:0")
+    sync = torch.cuda.synchronize
+    count = torch.cuda.device_count()
+    emit("backend", backend)
+    emit("device_count", count)
+    for i in range(min(count, 4)):
+        p = torch.cuda.get_device_properties(i)
+        name = str(p.name).replace("|", "/").replace("\n", " ")
+        mem_gib = float(p.total_memory) / (1024**3)
+        detail = f"{name}; vram={mem_gib:.2f} GiB"
+        if backend == "cuda":
+            try:
+                cc = torch.cuda.get_device_capability(i)
+                detail += f"; compute={cc[0]}.{cc[1]}"
+            except Exception:
+                pass
+        else:
+            arch = getattr(p, "gcnArchName", None)
+            if arch:
+                detail += f"; arch={arch}"
+        emit(f"device_{i}", detail)
+    try:
+        emit("bf16_reported", str(bool(torch.cuda.is_bf16_supported())).lower())
+    except Exception:
+        emit("bf16_reported", "unknown")
+elif mps_ok:
+    backend = "mps"
+    device = torch.device("mps")
+    sync = torch.mps.synchronize
+    emit("backend", backend)
+    emit("device_count", 1)
+elif xpu_ok:
+    backend = "xpu"
+    device = torch.device("xpu:0")
+    sync = torch.xpu.synchronize
+    emit("backend", backend)
+    try:
+        emit("device_count", torch.xpu.device_count())
+        emit("device_0", str(torch.xpu.get_device_name(0)).replace("|", "/").replace("\n", " "))
+    except Exception:
+        pass
+else:
+    emit("backend", "none")
+    emit("execution", "SKIP: no usable GPU backend")
+    raise SystemExit(0)
+
+torch.set_grad_enabled(False)
+try:
+    a = torch.ones((512, 512), device=device, dtype=torch.float32)
+    b = torch.ones((512, 512), device=device, dtype=torch.float32)
+    c = a @ b
+    sync()
+    ok = abs(float(c[0, 0].item()) - 512.0) < 0.01
+    emit("execution", "PASS" if ok else "FAIL: wrong result")
+    if not ok:
+        raise SystemExit(2)
+except Exception as e:
+    emit("execution", "FAIL/BLOCKED")
+    raise SystemExit(3)
+
+for dtype_name, dtype in (("fp16", torch.float16), ("bf16", torch.bfloat16)):
+    try:
+        a = torch.ones((32, 32), device=device, dtype=dtype)
+        c = a @ a
+        sync()
+        ok = abs(float(c[0, 0].item()) - 32.0) < 0.5
+        emit(f"{dtype_name}_matmul", "PASS" if ok else "FAIL")
+    except Exception:
+        emit(f"{dtype_name}_matmul", "UNAVAILABLE")
+
+try:
+    n = 2048
+    a = torch.ones((n, n), device=device, dtype=torch.float32)
+    b = torch.ones((n, n), device=device, dtype=torch.float32)
+    _ = a @ b
+    sync()
+    times = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        c = a @ b
+        sync()
+        times.append(time.perf_counter() - t0)
+    if abs(float(c[0, 0].item()) - float(n)) >= 0.01:
+        raise RuntimeError("wrong result")
+    med = statistics.median(times)
+    gflops = (2.0 * n * n * n) / med / 1e9
+    emit("matmul_2048_f32_ms", f"{med*1000:.3f}")
+    emit("matmul_2048_GFLOPs", f"{gflops:.2f}")
+except Exception:
+    emit("benchmark", "FAIL/BLOCKED")
+' 2>/dev/null)
+  rc=$?
+
+  if [ "$rc" -eq 10 ]; then
+    kv "torch GPU probe" "SKIP: torch absent/unavailable"
+    return
+  fi
+  if [ "$rc" -eq 124 ]; then
+    kv "torch GPU probe" "BLOCKED/TIMEOUT"
+    return
+  fi
+  if [ -n "$out" ]; then
+    while IFS='|' read -r key value; do
+      [ -n "$key" ] || continue
+      kv "gpu.$key" "$(printf '%s' "$value" | cut -c1-190)"
+    done <<EOF_GPU_OUT
+$out
+EOF_GPU_OUT
+  else
+    kv "torch GPU probe" "FAIL/BLOCKED (exit $rc)"
+  fi
+}
+
 
 ROOTLESS_UID=""
 ROOTLESS_GID=""
@@ -815,7 +1138,7 @@ section "PROBE"
 kv "probe version" "$VERSION"
 if have date; then kv "timestamp UTC" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"; fi
 kv "mode" "single standardized run"
-kv "active tests" "temp write, local TCP, gcc compile, rootless namespaces/runtime info, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
+kv "active tests" "temp write, local TCP, gcc compile, rootless namespaces/runtime info, CPU/ML/GPU execution, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
 kv "test packages" "$PY_PACKAGE; $MS_PACKAGE; $ZOD_PACKAGE; apt:hello"
 kv "portable Deno fallback" "v$DENO_VERSION when Deno is absent"
 kv "safety" "bounded tests; temp artifacts; guarded apt install+purge; no secret/private-file inspection"
@@ -869,6 +1192,7 @@ if [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -r /sys/fs/cgroup/cpu/cpu.cfs
   q=$(read_file_line /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(read_file_line /sys/fs/cgroup/cpu/cpu.cfs_period_us)
   kv "cgroup v1 CPU quota" "$q / $p us"
 fi
+cpu_isa_inventory
 
 section "MEMORY / SWAP"
 if [ -r /proc/meminfo ]; then
@@ -935,12 +1259,18 @@ if have nvidia-smi; then
 else
   kv "nvidia-smi" "absent"
 fi
+kv "rocm-smi" "$([ -x "$(command -v rocm-smi 2>/dev/null || printf /nonexistent)" ] && echo present || echo absent)"
+kv "rocminfo" "$([ -x "$(command -v rocminfo 2>/dev/null || printf /nonexistent)" ] && echo present || echo absent)"
 if have lspci; then
   gpu=$(lspci 2>/dev/null | grep -Ei 'vga|3d controller|display controller' | head -n 8 || true)
   if [ -n "$gpu" ]; then printf '%s\n' "$gpu" | sed 's/^/  PCI GPU: /'; else kv "lspci GPU" "none visible"; fi
 else
   kv "lspci" "unavailable"
 fi
+
+python_ml_inventory
+cpu_ml_benchmark
+gpu_ml_capability_test
 
 section "DEVELOPMENT TOOLCHAIN"
 for x in \
@@ -954,7 +1284,7 @@ for x in \
 done
 
 section "INFRA / CONTAINER / ISOLATION TOOLS"
-for x in docker podman buildah kubectl helm terraform ansible lsns unshare nsenter capsh getcap chroot findmnt setpriv newuidmap newgidmap fuse-overlayfs slirp4netns pasta runc crun bwrap proot rootlesskit dockerd-rootless.sh; do safe_version "$x"; done
+for x in docker podman buildah kubectl helm terraform ansible lsns unshare nsenter capsh getcap chroot findmnt setpriv newuidmap newgidmap fuse-overlayfs slirp4netns pasta runc crun bwrap proot rootlesskit dockerd-rootless.sh rocm-smi rocminfo; do safe_version "$x"; done
 
 section "ARCHIVE / BINARY TOOLS"
 for x in zip unzip tar gzip bzip2 xz zstd file strings readelf objdump nm; do safe_version "$x"; done
