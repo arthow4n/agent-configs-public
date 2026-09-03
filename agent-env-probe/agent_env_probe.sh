@@ -9,7 +9,7 @@
 set -u
 set -o pipefail
 
-VERSION="2.4.1"
+VERSION="2.5.0"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -413,6 +413,152 @@ finally:
 ' >/dev/null 2>&1
   rc=$?
   [ "$rc" -eq 0 ] && kv "127.0.0.1 TCP bind/connect" "PASS (ephemeral port)" || kv "127.0.0.1 TCP bind/connect" "FAIL/BLOCKED (exit $rc)"
+}
+
+dev_server_test() {
+  section "DEVELOPMENT SERVER WORKFLOW"
+  local py="" rc
+  if have python3; then py=$(command -v python3); elif have python; then py=$(command -v python); fi
+  [ -n "$py" ] || { kv "background HTTP server" "SKIP: Python absent"; return; }
+
+  bounded 15 "$py" -I -c '
+import subprocess, sys, urllib.request
+
+child_code = r"""
+import http.server
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"agent-dev-server-probe"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+"""
+process = subprocess.Popen(
+    [sys.executable, "-I", "-c", child_code],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+)
+try:
+    port = int(process.stdout.readline().strip())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/", timeout=3) as response:
+        body = response.read()
+    if response.status != 200 or body != b"agent-dev-server-probe":
+        raise SystemExit(2)
+finally:
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=1)
+raise SystemExit(0 if process.poll() is not None else 3)
+' >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "background HTTP server" "PASS (start/request/stop)" || kv "background HTTP server" "FAIL/BLOCKED (exit $rc)"
+}
+
+network_destination_test() {
+  section "DEVELOPMENT NETWORK DESTINATIONS (HEAD ONLY)"
+  local label url code rc py=""
+  if ! have curl; then
+    if have python3; then py=$(command -v python3); elif have python; then py=$(command -v python); fi
+  fi
+
+  while IFS='|' read -r label url; do
+    [ -n "$label" ] || continue
+    if have curl; then
+      code=$(bounded 12 curl -sS -I -o /dev/null -w '%{http_code}' --proto '=https' --connect-timeout 4 --max-time 10 "$url" 2>/dev/null)
+      rc=$?
+      if [ "$rc" -eq 0 ] && printf '%s' "$code" | grep -Eq '^[1-5][0-9][0-9]$'; then
+        kv "net.$label" "REACHABLE (HTTP $code)"
+      elif [ "$rc" -eq 124 ]; then
+        kv "net.$label" "TIMEOUT"
+      else
+        kv "net.$label" "BLOCKED/FAIL"
+      fi
+    elif [ -n "$py" ]; then
+      bounded 12 "$py" -I -c '
+import sys, urllib.error, urllib.request
+request = urllib.request.Request(sys.argv[1], method="HEAD")
+try:
+    urllib.request.urlopen(request, timeout=8).close()
+except urllib.error.HTTPError:
+    pass
+except Exception:
+    raise SystemExit(1)
+' "$url" >/dev/null 2>&1
+      rc=$?
+      [ "$rc" -eq 0 ] && kv "net.$label" "REACHABLE" || kv "net.$label" "BLOCKED/FAIL"
+    else
+      kv "net.$label" "SKIP: curl/Python absent"
+    fi
+  done <<'EOF_NETWORK_DESTINATIONS'
+github_web|https://github.com/
+github_api|https://api.github.com/
+github_raw|https://raw.githubusercontent.com/github/gitignore/main/README.md
+pypi|https://pypi.org/simple/
+npm|https://registry.npmjs.org/
+maven_central|https://repo.maven.apache.org/maven2/
+google_android|https://dl.google.com/android/repository/repository2-1.xml
+gradle_plugins|https://plugins.gradle.org/
+crates_io|https://crates.io/
+go_proxy|https://proxy.golang.org/
+docker_registry|https://registry-1.docker.io/v2/
+EOF_NETWORK_DESTINATIONS
+}
+
+filesystem_capability_test() {
+  section "FILESYSTEM CAPABILITY TEST"
+  local d out rc
+  ensure_probe_tmp || { kv "filesystem capabilities" "BLOCKED: temp directory unavailable"; return; }
+  d="$PROBE_TMP/filesystem"
+  mkdir -p "$d/nested/child" || { kv "nested directories" "FAIL/BLOCKED"; return; }
+  kv "nested directories" "PASS"
+
+  printf '%s\n' 'agent-file-probe' >"$d/original"
+  mv "$d/original" "$d/renamed" 2>/dev/null
+  if [ -f "$d/renamed" ] && [ "$(sed -n '1p' "$d/renamed" 2>/dev/null)" = "agent-file-probe" ]; then
+    rm -f "$d/renamed" 2>/dev/null
+    [ ! -e "$d/renamed" ] && kv "file create/rename/delete" "PASS" || kv "file create/rename/delete" "FAIL: delete"
+  else
+    kv "file create/rename/delete" "FAIL: create/rename"
+  fi
+
+  printf '%s\n' 'agent-link-probe' >"$d/link-target"
+  if ln -s link-target "$d/symlink" 2>/dev/null && [ "$(sed -n '1p' "$d/symlink" 2>/dev/null)" = "agent-link-probe" ]; then
+    kv "symbolic links" "PASS"
+  else
+    kv "symbolic links" "FAIL/BLOCKED"
+  fi
+  if ln "$d/link-target" "$d/hardlink" 2>/dev/null && [ "$d/link-target" -ef "$d/hardlink" ]; then
+    kv "hard links" "PASS"
+  else
+    kv "hard links" "FAIL/BLOCKED"
+  fi
+
+  printf '%s\n' 'lower' >"$d/case-probe"
+  printf '%s\n' 'upper' >"$d/CASE-PROBE"
+  if [ -f "$d/case-probe" ] && [ -f "$d/CASE-PROBE" ] && \
+     [ "$(sed -n '1p' "$d/case-probe" 2>/dev/null)" = "lower" ] && \
+     [ "$(sed -n '1p' "$d/CASE-PROBE" 2>/dev/null)" = "upper" ]; then
+    kv "case-sensitive filenames" "yes"
+  else
+    kv "case-sensitive filenames" "no/unsupported"
+  fi
+
+  printf '%s\n' '#!/bin/sh' 'printf agent-exec-probe' >"$d/executable"
+  chmod u+x "$d/executable" 2>/dev/null
+  out=$(bounded 5 "$d/executable" 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "agent-exec-probe" ] && kv "local executable file" "PASS" || kv "local executable file" "FAIL/BLOCKED (exit $rc)"
 }
 
 gcc_compile_test() {
@@ -1432,7 +1578,7 @@ section "PROBE"
 kv "probe version" "$VERSION"
 if have date; then kv "timestamp UTC" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"; fi
 kv "mode" "single standardized run"
-kv "active tests" "temp write, local TCP, developer builds, Android/Gradle, headless browser, local-image container, Git workflow, rootless namespaces/runtime info, CPU/ML/GPU execution, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
+kv "active tests" "filesystem capabilities, local TCP/dev server, development HTTPS destinations, developer builds, Android/Gradle, headless browser, local-image container, Git workflow, rootless namespaces/runtime info, CPU/ML/GPU execution, sudo, apt hello, Python/npm/Deno packages"
 kv "test packages" "$PY_PACKAGE; $MS_PACKAGE; $ZOD_PACKAGE; apt:hello"
 kv "portable Deno fallback" "v$DENO_VERSION when Deno is absent"
 kv "safety" "bounded tests; temp artifacts; guarded apt install+purge; no secret/private-file inspection"
@@ -1629,6 +1775,7 @@ else
   kv "socket listener inventory" "ss unavailable"
 fi
 local_socket_test
+dev_server_test
 
 section "OUTBOUND NETWORK TEST"
 if have getent; then
@@ -1644,6 +1791,7 @@ elif have wget; then
 else
   kv "HTTPS example.com" "SKIP: curl/wget unavailable"
 fi
+network_destination_test
 
 section "TEMP WRITE TEST"
 if ensure_probe_tmp; then
@@ -1659,6 +1807,7 @@ else
   kv "temporary directory" "BLOCKED: /tmp unavailable/not writable"
 fi
 
+filesystem_capability_test
 gcc_compile_test
 developer_build_tests
 android_gradle_test
