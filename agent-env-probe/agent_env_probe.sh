@@ -158,6 +158,7 @@ pids_limit_v2() {
   [ -r /sys/fs/cgroup/pids.current ] && kv "cgroup pids.current" "$(read_file_line /sys/fs/cgroup/pids.current)"
 }
 
+
 bounded() {
   local secs=$1
   shift
@@ -177,7 +178,6 @@ cleanup_probe_tmp() {
   esac
 }
 trap cleanup_probe_tmp EXIT
-
 sha256_file() {
   local f=$1
   if have sha256sum; then sha256sum "$f" 2>/dev/null | awk '{print $1}'; return; fi
@@ -637,6 +637,7 @@ for x in curl wget jq rg sqlite3 psql mysql redis-cli ssh; do safe_version "$x";
 section "BROWSER / DOCUMENT / MEDIA TOOLS"
 for x in chromium chromium-browser google-chrome google-chrome-stable firefox libreoffice soffice pandoc ffmpeg convert magick tesseract pdftotext gs; do safe_version "$x"; done
 
+
 section "PRIVILEGE SURFACE"
 uid=$(id -u 2>/dev/null || echo unknown)
 kv "effective UID" "$uid"
@@ -701,22 +702,6 @@ else
   kv "temporary probe tree" "nothing created"
 fi
 PROBE_TMP=""
-
-section "INTENTIONALLY NOT PROBED"
-printf '%s\n' \
-  "  secrets / environment-variable values / tokens / credentials" \
-  "  browser cookies, profiles, saved passwords, or authentication databases" \
-  "  SSH keys/config, Git credential stores, cloud CLI credentials" \
-  "  arbitrary user-file contents or directory listings" \
-  "  process command lines" \
-  "  cloud instance-metadata services or public egress IP" \
-  "  remote port scans or unsolicited connections" \
-  "  sustained CPU/RAM/disk/network stress benchmarks" \
-  "  service/daemon installation or configuration" \
-  "  apt-get update, autoremove, upgrade, or unrelated package changes" \
-  "  cross-session file/process persistence (requires a deliberate later run)" \
-  "  browser-agent automation/session persistence (must be tested at the agent/browser layer)" \
-  "  maximum task duration or multi-agent concurrency (requires external orchestration)"
 
 section "END"
 kv "result" "probe completed"
