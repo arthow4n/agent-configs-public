@@ -9,7 +9,7 @@
 set -u
 set -o pipefail
 
-VERSION="2.5.0"
+VERSION="2.5.1"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -107,6 +107,56 @@ environment_inventory() {
   env_path_status TMPDIR
   env_presence DISPLAY
   env_presence WAYLAND_DISPLAY
+}
+
+starting_directory_inventory() {
+  section "STARTING DIRECTORY / REPOSITORY"
+  local top prefix git_dir shallow depth count
+  kv "current directory writable" "$([ -w . ] && echo yes || echo no)"
+
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    kv "inside Git worktree" "no/unavailable"
+    return
+  fi
+  kv "inside Git worktree" "yes"
+
+  top=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  prefix=$(git rev-parse --show-prefix 2>/dev/null || true)
+  if [ -n "$top" ] && [ -z "$prefix" ]; then
+    kv "starts at worktree root" "yes"
+    kv "directory depth below root" "0"
+  elif [ -n "$top" ]; then
+    depth=$(printf '%s' "$prefix" | tr -cd '/' | wc -c | tr -d ' ')
+    kv "starts at worktree root" "no"
+    kv "directory depth below root" "${depth:-unknown}"
+  else
+    kv "starts at worktree root" "unknown"
+    kv "directory depth below root" "unknown"
+  fi
+
+  git_dir=$(git rev-parse --git-dir 2>/dev/null || true)
+  if [ -n "$git_dir" ]; then
+    kv "Git metadata readable" "$([ -r "$git_dir/HEAD" ] && echo yes || echo no)"
+    kv "Git metadata writable" "$([ -w "$git_dir" ] && echo yes || echo no)"
+  else
+    kv "Git metadata readable" "unknown"
+    kv "Git metadata writable" "unknown"
+  fi
+
+  shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || true)
+  case "$shallow" in true|false) kv "shallow repository" "$shallow" ;; *) kv "shallow repository" "unknown" ;; esac
+  if [ -n "$top" ] && [ -f "$top/.git" ]; then
+    kv "linked worktree" "yes"
+  else
+    kv "linked worktree" "no"
+  fi
+
+  if [ -n "$top" ] && [ -f "$top/.gitmodules" ]; then
+    count=$(git config -f "$top/.gitmodules" --get-regexp '^submodule\..*\.path$' 2>/dev/null | wc -l | tr -d ' ' || true)
+    kv "declared submodules" "${count:-unknown}"
+  else
+    kv "declared submodules" "0"
+  fi
 }
 
 redact_line() {
@@ -1597,6 +1647,7 @@ kv "architecture" "$(uname -m 2>/dev/null || echo unknown)"
 kv "machine word size" "$(getconf LONG_BIT 2>/dev/null || echo unknown)-bit"
 
 environment_inventory
+starting_directory_inventory
 
 section "VIRTUALIZATION / CONTAINER"
 virt="unknown"
