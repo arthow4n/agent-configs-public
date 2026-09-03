@@ -9,7 +9,7 @@
 set -u
 set -o pipefail
 
-VERSION="2.3.0"
+VERSION="2.3.1"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -36,11 +36,13 @@ DENO_SHA_DARWIN_X86_64="7d4524b82bcc557fe020a1a5b56956ed42b992ae5b28026e8ad5d173
 DENO_SHA_DARWIN_AARCH64="213a2f304f04d3c9cb5220669afad138f60a5aab1fe80962abdeb8f35807a472"
 
 PROBE_TMP=""
+APT_HELLO_INSTALLED=0
+APT_PRIV_MODE=""
 
 have() { command -v "$1" >/dev/null 2>&1; }
 section() { printf '\n===== %s =====\n' "$1"; }
 kv() { printf '%-32s %s\n' "$1:" "$2"; }
-first_line() { "$@" 2>&1 | sed -n '1p' | tr '\t' ' '; }
+first_line() { bounded 8 "$@" 2>&1 | sed -n '1p' | tr '\t' ' '; }
 read_file_line() { [ -r "$1" ] && sed -n '1p' "$1" 2>/dev/null || true; }
 
 redact_line() {
@@ -52,7 +54,7 @@ redact_line() {
 }
 
 safe_version() {
-  local cmd=$1 out=""
+  local cmd=$1 out="" rc=0
   if ! have "$cmd"; then
     printf '%-20s %s\n' "$cmd" "absent"
     return
@@ -60,67 +62,67 @@ safe_version() {
 
   case "$cmd" in
     python|python3|pip|pip3|uv|node|npm|pnpm|yarn|bun|deno|rustc|cargo|gcc|g++|clang|cmake|make|ninja|meson|git|gh|docker|podman|buildah|kubectl|helm|terraform|ansible|curl|wget|jq|rg|sqlite3|ffmpeg|pandoc|tesseract|java|javac|dotnet|ruby|php|swift|swiftc|gfortran|corepack|npx|tsc|ts-node|pipx|ipython|jupyter|pytest|cython|numba|hf|playwright|ant|pkg-config|autoconf|automake|zip|tar|gzip|bzip2|xz|zstd|file|strings|readelf|objdump|nm|lsns|unshare|nsenter|chroot|findmnt|socat|rsync|weasyprint|cairosvg|inkscape|latex|pdflatex|xelatex|lualatex|ffprobe|sox|gpg)
-      out=$(first_line "$cmd" --version || true)
+      out=$(first_line "$cmd" --version)
       ;;
     go)
-      out=$(first_line go version || true)
+      out=$(first_line go version)
       ;;
     perl)
-      out=$(perl -v 2>&1 | awk 'NF {print; exit}' || true)
+      out=$(bounded 8 perl -v 2>&1 | awk 'NF {print; exit}')
       ;;
     R)
-      out=$(first_line R --version || true)
+      out=$(first_line R --version)
       ;;
     kotlin|kotlinc)
-      out=$(first_line "$cmd" -version || true)
+      out=$(first_line "$cmd" -version)
       ;;
     libreoffice|soffice)
-      out=$(first_line "$cmd" --version || true)
+      out=$(first_line "$cmd" --version)
       ;;
     convert)
-      out=$(convert -version 2>/dev/null | sed -n '1p' || true)
+      out=$(bounded 8 convert -version 2>/dev/null | sed -n '1p')
       ;;
     magick)
-      out=$(magick -version 2>/dev/null | sed -n '1p' || true)
+      out=$(bounded 8 magick -version 2>/dev/null | sed -n '1p')
       ;;
     gs)
-      out=$(first_line gs --version || true)
+      out=$(first_line gs --version)
       ;;
     pdftotext|pdfinfo|pdftoppm|pdfimages|pdfunite)
-      out=$(first_line "$cmd" -v || true)
+      out=$(first_line "$cmd" -v)
       ;;
     ssh)
-      out=$(ssh -V 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 ssh -V 2>&1 | sed -n '1p')
       ;;
     psql)
-      out=$(first_line psql --version || true)
+      out=$(first_line psql --version)
       ;;
     mysql)
-      out=$(mysql --version 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 mysql --version 2>&1 | sed -n '1p')
       ;;
     redis-cli)
-      out=$(redis-cli --version 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 redis-cli --version 2>&1 | sed -n '1p')
       ;;
     chromium|chromium-browser|google-chrome|google-chrome-stable|firefox)
-      out=$(first_line "$cmd" --version || true)
+      out=$(first_line "$cmd" --version)
       ;;
     unzip)
-      out=$(unzip -v 2>/dev/null | sed -n '1p' || true)
+      out=$(bounded 8 unzip -v 2>/dev/null | sed -n '1p')
       ;;
     capsh)
-      out=$(capsh --help 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 capsh --help 2>&1 | sed -n '1p')
       ;;
     ip)
-      out=$(ip -Version 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 ip -Version 2>&1 | sed -n '1p')
       ;;
     ping)
-      out=$(ping -V 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 ping -V 2>&1 | sed -n '1p')
       ;;
     dot)
-      out=$(dot -V 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 dot -V 2>&1 | sed -n '1p')
       ;;
     openssl)
-      out=$(openssl version 2>&1 | sed -n '1p' || true)
+      out=$(bounded 8 openssl version 2>&1 | sed -n '1p')
       ;;
     torchrun|xvfb-run|getcap|nc)
       out="present"
@@ -129,6 +131,13 @@ safe_version() {
       out="present"
       ;;
   esac
+
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    out="TIMEOUT"
+  elif [ "$rc" -eq 125 ]; then
+    out="SKIP: timeout utility unavailable"
+  fi
 
   out=$(printf '%s' "$out" | redact_line | cut -c1-220)
   [ -n "$out" ] || out="present (version unavailable)"
@@ -226,7 +235,13 @@ cpu_isa_inventory() {
 bounded() {
   local secs=$1
   shift
-  if have timeout; then timeout "${secs}s" "$@"; else "$@"; fi
+  if have timeout; then
+    timeout "${secs}s" "$@"
+  elif have gtimeout; then
+    gtimeout "${secs}s" "$@"
+  else
+    return 125
+  fi
 }
 
 ensure_probe_tmp() {
@@ -241,7 +256,18 @@ cleanup_probe_tmp() {
     /tmp/agent-env-probe.*) rm -rf -- "$PROBE_TMP" 2>/dev/null || true ;;
   esac
 }
-trap cleanup_probe_tmp EXIT
+
+cleanup_on_exit() {
+  if [ "$APT_HELLO_INSTALLED" -eq 1 ] && [ -n "$APT_PRIV_MODE" ]; then
+    run_priv_bounded 60 "$APT_PRIV_MODE" env DEBIAN_FRONTEND=noninteractive LC_ALL=C \
+      apt-get -y -o Acquire::Retries=0 -o Dpkg::Use-Pty=0 purge hello >/dev/null 2>&1 || true
+  fi
+  cleanup_probe_tmp
+}
+trap cleanup_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 sha256_file() {
   local f=$1
@@ -633,6 +659,9 @@ except Exception:
     done <<EOF_GPU_OUT
 $out
 EOF_GPU_OUT
+    if [ "$rc" -ne 0 ]; then
+      kv "torch GPU probe" "FAIL/BLOCKED (exit $rc; partial results above)"
+    fi
   else
     kv "torch GPU probe" "FAIL/BLOCKED (exit $rc)"
   fi
@@ -1063,6 +1092,7 @@ apt_hello_test() {
   have dpkg-query || { kv "apt.dpkg_query" "SKIP: dpkg-query absent"; return; }
   ensure_probe_tmp || { kv "apt.temp_dir" "BLOCKED"; return; }
   mode=$(root_mode)
+  APT_PRIV_MODE="$mode"
   kv "apt.privilege_mode" "$mode"
 
   if dpkg-query -W -f='${Status}' hello 2>/dev/null | grep -q '^install ok installed$'; then before=1; fi
@@ -1107,17 +1137,20 @@ apt_hello_test() {
   if [ "$rc" -ne 0 ]; then
     kv "apt.install_test" "FAIL/BLOCKED (exit $rc)"
     if dpkg-query -W -f='${Status}' hello 2>/dev/null | grep -q '^install ok installed$'; then
+      APT_HELLO_INSTALLED=1
       run_priv_bounded 60 "$mode" env DEBIAN_FRONTEND=noninteractive LC_ALL=C \
         apt-get -y -o Acquire::Retries=0 -o Dpkg::Use-Pty=0 purge hello >/dev/null 2>&1 || true
       if dpkg-query -W -f='${Status}' hello 2>/dev/null | grep -q '^install ok installed$'; then
         kv "apt.cleanup_after_failure" "FAIL: verify/remove hello manually"
       else
+        APT_HELLO_INSTALLED=0
         kv "apt.cleanup_after_failure" "PASS: partial hello install removed"
       fi
     fi
     return
   fi
   kv "apt.install_test" "PASS"
+  APT_HELLO_INSTALLED=1
 
   if dpkg-query -W -f='${Status}' hello 2>/dev/null | grep -q '^install ok installed$'; then after=1; fi
   hello_out=$(LC_ALL=C hello 2>/dev/null | sed -n '1p' || true)
@@ -1128,6 +1161,7 @@ apt_hello_test() {
   rc=$?
   if [ "$rc" -eq 0 ] && ! dpkg-query -W -f='${Status}' hello 2>/dev/null | grep -q '^install ok installed$'; then
     kv "apt.cleanup" "PASS: hello purged"
+    APT_HELLO_INSTALLED=0
   else
     kv "apt.cleanup" "FAIL: verify/remove hello manually"
   fi
