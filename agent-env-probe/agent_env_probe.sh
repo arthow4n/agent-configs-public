@@ -9,7 +9,7 @@
 set -u
 set -o pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -316,6 +316,248 @@ EOF_C
   fi
 }
 
+ROOTLESS_UID=""
+ROOTLESS_GID=""
+ROOTLESS_NAME=""
+ROOTLESS_MODE=""
+ROOTLESS_PY=""
+
+prepare_rootless_identity() {
+  local uid gid name py=""
+  uid=$(id -u 2>/dev/null || echo unknown)
+  gid=$(id -g 2>/dev/null || echo unknown)
+  if [ "$uid" != "0" ] && printf '%s' "$uid" | grep -Eq '^[0-9]+$'; then
+    ROOTLESS_UID="$uid"
+    ROOTLESS_GID="$gid"
+    ROOTLESS_NAME=$(id -un 2>/dev/null || true)
+    ROOTLESS_MODE="current"
+    return 0
+  fi
+
+  if id nobody >/dev/null 2>&1; then
+    ROOTLESS_UID=$(id -u nobody 2>/dev/null || echo 65534)
+    ROOTLESS_GID=$(id -g nobody 2>/dev/null || echo 65534)
+    ROOTLESS_NAME="nobody"
+  else
+    ROOTLESS_UID="65534"
+    ROOTLESS_GID="65534"
+    if have getent; then ROOTLESS_NAME=$(getent passwd 65534 2>/dev/null | awk -F: 'NR==1 {print $1}' || true); fi
+  fi
+
+  if have setpriv; then
+    ROOTLESS_MODE="setpriv"
+    return 0
+  fi
+  if have python3; then py=$(command -v python3); elif have python; then py=$(command -v python); fi
+  if [ -n "$py" ]; then
+    ROOTLESS_PY="$py"
+    ROOTLESS_MODE="python-drop"
+    return 0
+  fi
+  ROOTLESS_MODE="unavailable"
+  return 1
+}
+
+run_rootless_bounded() {
+  local secs=$1
+  shift
+  case "$ROOTLESS_MODE" in
+    current)
+      bounded "$secs" "$@"
+      ;;
+    setpriv)
+      bounded "$secs" setpriv         --reuid="$ROOTLESS_UID" --regid="$ROOTLESS_GID" --clear-groups         --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"
+      ;;
+    python-drop)
+      bounded "$secs" "$ROOTLESS_PY" -I -c '
+import ctypes, os, sys
+uid, gid = int(sys.argv[1]), int(sys.argv[2])
+cmd = sys.argv[3:]
+os.setgroups([])
+os.setgid(gid)
+os.setuid(uid)
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+    raise SystemExit(126)
+os.execvp(cmd[0], cmd)
+' "$ROOTLESS_UID" "$ROOTLESS_GID" "$@"
+      ;;
+    *)
+      return 126
+      ;;
+  esac
+}
+
+rootless_level1_test() {
+  section "ROOTLESS LEVEL 1 / KERNEL NAMESPACES"
+  local rc v
+  if ! prepare_rootless_identity; then
+    kv "rootless test identity" "BLOCKED: cannot obtain unprivileged execution identity"
+    return
+  fi
+  if [ "$ROOTLESS_MODE" = "current" ]; then
+    kv "rootless test identity" "uid=$ROOTLESS_UID gid=$ROOTLESS_GID (current non-root user)"
+  else
+    kv "rootless test identity" "uid=$ROOTLESS_UID gid=$ROOTLESS_GID (privileges deliberately dropped)"
+  fi
+
+  if [ -r /proc/sys/kernel/unprivileged_userns_clone ]; then
+    v=$(read_file_line /proc/sys/kernel/unprivileged_userns_clone)
+    kv "unprivileged_userns_clone" "${v:-unknown}"
+  else
+    kv "unprivileged_userns_clone" "not exposed"
+  fi
+  if [ -r /proc/sys/user/max_user_namespaces ]; then
+    v=$(read_file_line /proc/sys/user/max_user_namespaces)
+    kv "max_user_namespaces" "${v:-unknown}"
+  else
+    kv "max_user_namespaces" "not exposed"
+  fi
+
+  have unshare || {
+    kv "rootless.user_namespace" "SKIP: unshare absent"
+    kv "rootless.uid0_mapping" "SKIP: unshare absent"
+    kv "rootless.mount_namespace" "SKIP: unshare absent"
+    kv "rootless.pid_namespace" "SKIP: unshare absent"
+    kv "rootless.proc_mount" "SKIP: unshare absent"
+    return
+  }
+
+  (cd /tmp && run_rootless_bounded 8 unshare --user sh -c 'true') >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    kv "rootless.user_namespace" "PASS"
+  else
+    kv "rootless.user_namespace" "FAIL/BLOCKED (exit $rc)"
+    kv "rootless.uid0_mapping" "SKIP: user namespace unavailable"
+    kv "rootless.mount_namespace" "SKIP: user namespace unavailable"
+    kv "rootless.pid_namespace" "SKIP: user namespace unavailable"
+    kv "rootless.proc_mount" "SKIP: user namespace unavailable"
+    return
+  fi
+
+  (cd /tmp && run_rootless_bounded 8 unshare --user --map-root-user sh -c 'test "$(id -u)" = 0') >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "rootless.uid0_mapping" "PASS" || kv "rootless.uid0_mapping" "FAIL/BLOCKED (exit $rc)"
+
+  (cd /tmp && run_rootless_bounded 8 unshare --user --map-root-user --mount sh -c 'test "$(id -u)" = 0 && test -r /proc/self/mountinfo') >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "rootless.mount_namespace" "PASS" || kv "rootless.mount_namespace" "FAIL/BLOCKED (exit $rc)"
+
+  (cd /tmp && run_rootless_bounded 8 unshare --user --map-root-user --pid --fork sh -c 'test "$$" -eq 1') >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "rootless.pid_namespace" "PASS (child is PID 1)" || kv "rootless.pid_namespace" "FAIL/BLOCKED (exit $rc)"
+
+  (cd /tmp && run_rootless_bounded 8 unshare --user --map-root-user --mount --pid --fork --mount-proc sh -c 'test "$$" -eq 1 && test -r /proc/1/status') >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "rootless.proc_mount" "PASS" || kv "rootless.proc_mount" "FAIL/BLOCKED (exit $rc)"
+}
+
+rootless_level2_inventory() {
+  section "ROOTLESS LEVEL 2 / SUPPORT COMPONENTS"
+  local file cg_rel cg_dir rc
+  prepare_rootless_identity >/dev/null 2>&1 || true
+
+  for x in newuidmap newgidmap fuse-overlayfs slirp4netns pasta runc crun bwrap proot rootlesskit dockerd-rootless.sh; do
+    safe_version "$x"
+  done
+  kv "/dev/fuse present" "$([ -e /dev/fuse ] && echo yes || echo no)"
+
+  for kind in subuid subgid; do
+    file="/etc/$kind"
+    if [ ! -r "$file" ]; then
+      kv "$kind entry for test user" "unavailable"
+    elif [ -z "$ROOTLESS_NAME" ]; then
+      kv "$kind entry for test user" "unknown: no account name"
+    elif awk -F: -v u="$ROOTLESS_NAME" '$1==u {found=1} END {exit !found}' "$file" 2>/dev/null; then
+      kv "$kind entry for test user" "yes"
+    else
+      kv "$kind entry for test user" "no"
+    fi
+  done
+
+  if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+    kv "cgroup v2" "yes"
+    cg_rel=$(awk -F: '$1=="0" {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)
+    cg_dir="/sys/fs/cgroup${cg_rel:-/}"
+    if [ "$ROOTLESS_MODE" = "unavailable" ]; then
+      kv "cgroup delegation writable" "unknown: no unprivileged identity"
+    else
+      run_rootless_bounded 5 sh -c 'test -w "$1/cgroup.procs"' sh "$cg_dir" >/dev/null 2>&1
+      rc=$?
+      [ "$rc" -eq 0 ] && kv "cgroup delegation writable" "yes" || kv "cgroup delegation writable" "no/blocked"
+    fi
+  else
+    kv "cgroup v2" "no/not exposed"
+    kv "cgroup delegation writable" "not applicable/unknown"
+  fi
+}
+
+prepare_rootless_runtime_tmp() {
+  local d=$1
+  mkdir -p "$d/home" "$d/run" "$d/tmp" || return 1
+  if [ "$ROOTLESS_MODE" != "current" ] && [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+    chown -R "$ROOTLESS_UID:$ROOTLESS_GID" "$d" 2>/dev/null || return 1
+  fi
+  chmod 700 "$d/home" "$d/run" "$d/tmp" 2>/dev/null || true
+}
+
+rootless_level3_runtime() {
+  section "ROOTLESS LEVEL 3 / INSTALLED RUNTIMES"
+  local d path_default out rc sock podman_bin docker_bin
+  prepare_rootless_identity >/dev/null 2>&1 || {
+    kv "rootless.podman_info" "SKIP: no unprivileged test identity"
+    kv "rootless.docker_info" "SKIP: no unprivileged test identity"
+    return
+  }
+  ensure_probe_tmp || {
+    kv "rootless.podman_info" "BLOCKED: temp directory unavailable"
+    kv "rootless.docker_info" "BLOCKED: temp directory unavailable"
+    return
+  }
+  d="$PROBE_TMP/rootless-runtime"
+  prepare_rootless_runtime_tmp "$d" || {
+    kv "rootless.podman_info" "BLOCKED: temp setup failed"
+    kv "rootless.docker_info" "BLOCKED: temp setup failed"
+    return
+  }
+  path_default="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  if have podman; then
+    podman_bin=$(command -v podman)
+    out=$(run_rootless_bounded 20 env -i PATH="$path_default" HOME="$d/home" XDG_RUNTIME_DIR="$d/run" TMPDIR="$d/tmp" LANG=C       "$podman_bin" info --format '{{.Host.Security.Rootless}}' 2>/dev/null | sed -n '1p' || true)
+    if [ "$out" = "true" ]; then
+      kv "rootless.podman_info" "PASS (rootless=true; no container created)"
+    elif [ -n "$out" ]; then
+      kv "rootless.podman_info" "FAIL/UNEXPECTED ($out)"
+    else
+      kv "rootless.podman_info" "FAIL/BLOCKED (no usable rootless info)"
+    fi
+  else
+    kv "rootless.podman_info" "SKIP: podman absent"
+  fi
+
+  if have docker; then
+    docker_bin=$(command -v docker)
+    sock="/run/user/$ROOTLESS_UID/docker.sock"
+    if [ ! -S "$sock" ]; then
+      kv "rootless.docker_info" "SKIP: no conventional rootless daemon socket"
+    else
+      out=$(run_rootless_bounded 15 env -i PATH="$path_default" HOME="$d/home" LANG=C DOCKER_HOST="unix://$sock"         "$docker_bin" info --format '{{json .SecurityOptions}}' 2>/dev/null | sed -n '1p' || true)
+      if printf '%s' "$out" | grep -qi 'rootless'; then
+        kv "rootless.docker_info" "PASS (rootless security option reported)"
+      elif [ -n "$out" ]; then
+        kv "rootless.docker_info" "FAIL: daemon reachable but rootless not reported"
+      else
+        kv "rootless.docker_info" "FAIL/BLOCKED: rootless daemon query failed"
+      fi
+    fi
+  else
+    kv "rootless.docker_info" "SKIP: docker absent"
+  fi
+}
+
+
 python_package_test() {
   section "PYTHON / PYPI PACKAGE TEST"
   local py="" d wheel actual rc minpath
@@ -573,7 +815,7 @@ section "PROBE"
 kv "probe version" "$VERSION"
 if have date; then kv "timestamp UTC" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"; fi
 kv "mode" "single standardized run"
-kv "active tests" "temp write, local TCP, gcc compile, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
+kv "active tests" "temp write, local TCP, gcc compile, rootless namespaces/runtime info, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
 kv "test packages" "$PY_PACKAGE; $MS_PACKAGE; $ZOD_PACKAGE; apt:hello"
 kv "portable Deno fallback" "v$DENO_VERSION when Deno is absent"
 kv "safety" "bounded tests; temp artifacts; guarded apt install+purge; no secret/private-file inspection"
@@ -712,7 +954,7 @@ for x in \
 done
 
 section "INFRA / CONTAINER / ISOLATION TOOLS"
-for x in docker podman buildah kubectl helm terraform ansible lsns unshare nsenter capsh getcap chroot findmnt; do safe_version "$x"; done
+for x in docker podman buildah kubectl helm terraform ansible lsns unshare nsenter capsh getcap chroot findmnt setpriv newuidmap newgidmap fuse-overlayfs slirp4netns pasta runc crun bwrap proot rootlesskit dockerd-rootless.sh; do safe_version "$x"; done
 
 section "ARCHIVE / BINARY TOOLS"
 for x in zip unzip tar gzip bzip2 xz zstd file strings readelf objdump nm; do safe_version "$x"; done
@@ -745,6 +987,10 @@ if have sudo; then
 else
   kv "passwordless sudo" "not testable: sudo absent"
 fi
+
+rootless_level1_test
+rootless_level2_inventory
+rootless_level3_runtime
 
 section "LOCAL NETWORK STACK"
 kv "loopback interface" "$([ -e /sys/class/net/lo ] && echo present || echo unavailable)"
