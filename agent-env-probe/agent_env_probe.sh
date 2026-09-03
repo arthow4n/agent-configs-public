@@ -9,7 +9,7 @@
 set -u
 set -o pipefail
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -44,6 +44,70 @@ section() { printf '\n===== %s =====\n' "$1"; }
 kv() { printf '%-32s %s\n' "$1:" "$2"; }
 first_line() { bounded 8 "$@" 2>&1 | sed -n '1p' | tr '\t' ' '; }
 read_file_line() { [ -r "$1" ] && sed -n '1p' "$1" 2>/dev/null || true; }
+
+env_presence() {
+  local name=$1 value=${!1-}
+  [ -n "$value" ] && kv "env.$name" "set" || kv "env.$name" "unset"
+}
+
+env_simple_value() {
+  local name=$1 value=${!1-} safe
+  if [ -z "$value" ]; then
+    kv "env.$name" "unset"
+    return
+  fi
+  safe=$(printf '%s' "$value" | tr -cd 'A-Za-z0-9_./:+@=-' | cut -c1-80)
+  if [ "$safe" = "$value" ]; then
+    kv "env.$name" "$safe"
+  else
+    kv "env.$name" "set (non-simple value hidden)"
+  fi
+}
+
+env_path_status() {
+  local name=$1 value=${!1-} kind="missing" readable="no" writable="no"
+  if [ -z "$value" ]; then
+    kv "env.$name" "unset"
+    return
+  fi
+  if [ -d "$value" ]; then kind="directory"; elif [ -f "$value" ]; then kind="file"; fi
+  [ -r "$value" ] && readable="yes"
+  [ -w "$value" ] && writable="yes"
+  kv "env.$name" "set; $kind; readable=$readable; writable=$writable"
+}
+
+env_path_list_status() {
+  local name=$1 value=${!1-} entry count=0 existing=0 writable=0
+  local -a entries=()
+  if [ -z "$value" ]; then
+    kv "env.$name" "unset"
+    return
+  fi
+  IFS=: read -r -a entries <<< "$value"
+  for entry in "${entries[@]}"; do
+    [ -n "$entry" ] || continue
+    count=$((count + 1))
+    [ -e "$entry" ] && existing=$((existing + 1))
+    [ -w "$entry" ] && writable=$((writable + 1))
+  done
+  kv "env.$name" "set; entries=$count; existing=$existing; writable=$writable"
+}
+
+environment_inventory() {
+  section "RUNTIME / BUILD CONFIGURATION ENV"
+  for name in JAVA_HOME ANDROID_HOME ANDROID_SDK_ROOT GRADLE_USER_HOME VIRTUAL_ENV CONDA_PREFIX CARGO_HOME RUSTUP_HOME GOMODCACHE DOTNET_ROOT; do
+    env_path_status "$name"
+  done
+  env_path_list_status GOPATH
+
+  section "EXECUTION ENVIRONMENT"
+  env_presence CI
+  if [ -n "${SHELL:-}" ]; then kv "env.SHELL" "${SHELL##*/}"; else kv "env.SHELL" "unset"; fi
+  for name in TERM COLORTERM LANG LC_ALL TZ; do env_simple_value "$name"; done
+  env_path_status TMPDIR
+  env_presence DISPLAY
+  env_presence WAYLAND_DISPLAY
+}
 
 redact_line() {
   sed -E \
@@ -1385,6 +1449,8 @@ fi
 kv "kernel" "$(uname -sr 2>/dev/null || echo unknown)"
 kv "architecture" "$(uname -m 2>/dev/null || echo unknown)"
 kv "machine word size" "$(getconf LONG_BIT 2>/dev/null || echo unknown)-bit"
+
+environment_inventory
 
 section "VIRTUALIZATION / CONTAINER"
 virt="unknown"
