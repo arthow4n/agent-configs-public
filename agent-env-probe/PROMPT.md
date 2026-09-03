@@ -1,0 +1,1 @@
+Run `./agent_env_probe.sh` without modifying the script. Do not add flags. Return the complete stdout verbatim. Do not inspect credentials, environment variables, user files, browser profiles, or other private data. If a command is unavailable or blocked, leave the reported result as unavailable/blocked rather than attempting to bypass the restriction.
