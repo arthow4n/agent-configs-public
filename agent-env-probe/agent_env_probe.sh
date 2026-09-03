@@ -9,7 +9,7 @@
 set -u
 set -o pipefail
 
-VERSION="2.3.1"
+VERSION="2.4.0"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -61,7 +61,7 @@ safe_version() {
   fi
 
   case "$cmd" in
-    python|python3|pip|pip3|uv|node|npm|pnpm|yarn|bun|deno|rustc|cargo|gcc|g++|clang|cmake|make|ninja|meson|git|gh|docker|podman|buildah|kubectl|helm|terraform|ansible|curl|wget|jq|rg|sqlite3|ffmpeg|pandoc|tesseract|java|javac|dotnet|ruby|php|swift|swiftc|gfortran|corepack|npx|tsc|ts-node|pipx|ipython|jupyter|pytest|cython|numba|hf|playwright|ant|pkg-config|autoconf|automake|zip|tar|gzip|bzip2|xz|zstd|file|strings|readelf|objdump|nm|lsns|unshare|nsenter|chroot|findmnt|socat|rsync|weasyprint|cairosvg|inkscape|latex|pdflatex|xelatex|lualatex|ffprobe|sox|gpg)
+    python|python3|pip|pip3|uv|node|npm|pnpm|yarn|bun|deno|rustc|cargo|gcc|g++|clang|cmake|make|ninja|meson|gradle|git|gh|docker|podman|buildah|kubectl|helm|terraform|ansible|curl|wget|jq|rg|sqlite3|ffmpeg|pandoc|tesseract|java|javac|dotnet|ruby|php|swift|swiftc|gfortran|corepack|npx|tsc|ts-node|pipx|ipython|jupyter|pytest|cython|numba|hf|playwright|ant|pkg-config|autoconf|automake|zip|tar|gzip|bzip2|xz|zstd|file|strings|readelf|objdump|nm|lsns|unshare|nsenter|chroot|findmnt|socat|rsync|weasyprint|cairosvg|inkscape|latex|pdflatex|xelatex|lualatex|ffprobe|sox|gpg)
       out=$(first_line "$cmd" --version)
       ;;
     go)
@@ -385,6 +385,202 @@ EOF_C
   else
     kv "gcc test cleanup" "FAIL"
   fi
+}
+
+developer_build_tests() {
+  section "DEVELOPER BUILD TESTS (NO DOWNLOADS)"
+  local d bin out rc
+  ensure_probe_tmp || { kv "developer builds" "BLOCKED: temp directory unavailable"; return; }
+  d="$PROBE_TMP/builds"
+  mkdir -p "$d" || { kv "developer builds" "BLOCKED: temp setup failed"; return; }
+
+  if have g++ || have clang++; then
+    if have g++; then bin=$(command -v g++); else bin=$(command -v clang++); fi
+    mkdir -p "$d/cpp"
+    printf '%s\n' '#include <iostream>' 'int main(){std::cout << "agent-cpp-probe";}' >"$d/cpp/main.cpp"
+    bounded 20 "$bin" -std=c++17 -O0 -o "$d/cpp/probe" "$d/cpp/main.cpp" >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      out=$(bounded 5 "$d/cpp/probe" 2>/dev/null || true)
+      [ "$out" = "agent-cpp-probe" ] && kv "C++ build/run" "PASS" || kv "C++ build/run" "FAIL: execution"
+    else
+      kv "C++ build/run" "FAIL/BLOCKED (compile exit $rc)"
+    fi
+  else
+    kv "C++ build/run" "SKIP: compiler absent"
+  fi
+
+  if have go; then
+    mkdir -p "$d/go/cache" "$d/go/modcache"
+    printf '%s\n' 'package main' 'import "fmt"' 'func main(){fmt.Print("agent-go-probe")}' >"$d/go/main.go"
+    (cd "$d/go" && bounded 30 env GOCACHE="$d/go/cache" GOMODCACHE="$d/go/modcache" GOPROXY=off GOENV=off go build -o probe main.go >/dev/null 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      out=$(bounded 5 "$d/go/probe" 2>/dev/null || true)
+      [ "$out" = "agent-go-probe" ] && kv "Go build/run" "PASS" || kv "Go build/run" "FAIL: execution"
+    else
+      kv "Go build/run" "FAIL/BLOCKED (build exit $rc)"
+    fi
+  else
+    kv "Go build/run" "SKIP: go absent"
+  fi
+
+  if have cargo; then
+    mkdir -p "$d/rust/src" "$d/rust/home"
+    printf '%s\n' '[package]' 'name="agent-rust-probe"' 'version="0.1.0"' 'edition="2021"' >"$d/rust/Cargo.toml"
+    printf '%s\n' 'fn main(){print!("agent-rust-probe");}' >"$d/rust/src/main.rs"
+    (cd "$d/rust" && bounded 45 env CARGO_HOME="$d/rust/home" CARGO_NET_OFFLINE=true cargo build --offline --quiet >/dev/null 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      out=$(bounded 5 "$d/rust/target/debug/agent-rust-probe" 2>/dev/null || true)
+      [ "$out" = "agent-rust-probe" ] && kv "Rust Cargo build/run" "PASS" || kv "Rust Cargo build/run" "FAIL: execution"
+    else
+      kv "Rust Cargo build/run" "FAIL/BLOCKED (build exit $rc)"
+    fi
+  else
+    kv "Rust Cargo build/run" "SKIP: cargo absent"
+  fi
+
+  if have javac && have java; then
+    mkdir -p "$d/java"
+    printf '%s\n' 'public class Probe { public static void main(String[] a) { System.out.print("agent-java-probe"); } }' >"$d/java/Probe.java"
+    bounded 30 javac -d "$d/java" "$d/java/Probe.java" >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      out=$(bounded 10 java -cp "$d/java" Probe 2>/dev/null || true)
+      [ "$out" = "agent-java-probe" ] && kv "Java compile/run" "PASS" || kv "Java compile/run" "FAIL: execution"
+    else
+      kv "Java compile/run" "FAIL/BLOCKED (compile exit $rc)"
+    fi
+  else
+    kv "Java compile/run" "SKIP: javac/java absent"
+  fi
+
+  if have dotnet; then
+    mkdir -p "$d/dotnet/feed" "$d/dotnet/home"
+    (cd "$d/dotnet" && bounded 30 env DOTNET_CLI_HOME="$d/dotnet/home" DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet new console --no-restore --force >/dev/null 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      (cd "$d/dotnet" && bounded 45 env DOTNET_CLI_HOME="$d/dotnet/home" DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet restore --source "$d/dotnet/feed" --ignore-failed-sources >/dev/null 2>&1 && bounded 45 env DOTNET_CLI_HOME="$d/dotnet/home" DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet run --no-restore >/dev/null 2>&1)
+      rc=$?
+    fi
+    [ "$rc" -eq 0 ] && kv ".NET build/run" "PASS" || kv ".NET build/run" "FAIL/BLOCKED (exit $rc)"
+  else
+    kv ".NET build/run" "SKIP: dotnet absent"
+  fi
+
+  if have swiftc; then
+    mkdir -p "$d/swift"
+    printf '%s\n' 'print("agent-swift-probe", terminator: "")' >"$d/swift/main.swift"
+    bounded 30 swiftc -o "$d/swift/probe" "$d/swift/main.swift" >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      out=$(bounded 5 "$d/swift/probe" 2>/dev/null || true)
+      [ "$out" = "agent-swift-probe" ] && kv "Swift build/run" "PASS" || kv "Swift build/run" "FAIL: execution"
+    else
+      kv "Swift build/run" "FAIL/BLOCKED (compile exit $rc)"
+    fi
+  else
+    kv "Swift build/run" "SKIP: swiftc absent"
+  fi
+}
+
+android_gradle_test() {
+  section "ANDROID / GRADLE TEST (NO DOWNLOADS)"
+  local d sdk="" android_jar="" candidate rc
+  have gradle || { kv "Gradle Android compile" "SKIP: gradle absent"; return; }
+  have javac || { kv "Gradle Android compile" "SKIP: javac absent"; return; }
+
+  for candidate in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" /opt/android-sdk /usr/local/android-sdk /android-sdk; do
+    [ -n "$candidate" ] && [ -d "$candidate/platforms" ] || continue
+    sdk="$candidate"
+    break
+  done
+  [ -n "$sdk" ] || { kv "Gradle Android compile" "SKIP: installed Android SDK not found"; return; }
+  android_jar=$(find "$sdk/platforms" -mindepth 2 -maxdepth 2 -type f -name android.jar -print 2>/dev/null | sort -V | tail -n 1)
+  [ -n "$android_jar" ] || { kv "Gradle Android compile" "SKIP: installed Android platform absent"; return; }
+  ensure_probe_tmp || { kv "Gradle Android compile" "BLOCKED: temp directory unavailable"; return; }
+  d="$PROBE_TMP/android-gradle"
+  mkdir -p "$d/src/main/java/probe" "$d/gradle-home" || { kv "Gradle Android compile" "BLOCKED: temp setup failed"; return; }
+  printf '%s\n' 'rootProject.name = "agent-android-probe"' >"$d/settings.gradle"
+  printf '%s\n' \
+    'plugins { id "java" }' \
+    'tasks.register("compileAndroidProbe", JavaCompile) {' \
+    '  source = fileTree("src/main/java")' \
+    '  classpath = files(System.getenv("ANDROID_PROBE_JAR"))' \
+    '  destinationDirectory = layout.buildDirectory.dir("android-probe")' \
+    '  options.compilerArgs += ["-proc:none"]' \
+    '}' >"$d/build.gradle"
+  printf '%s\n' 'package probe; public class ProbeActivity extends android.app.Activity {}' >"$d/src/main/java/probe/ProbeActivity.java"
+  (cd "$d" && bounded 60 env ANDROID_PROBE_JAR="$android_jar" GRADLE_USER_HOME="$d/gradle-home" gradle --offline --no-daemon --console=plain compileAndroidProbe >/dev/null 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -f "$d/build/android-probe/probe/ProbeActivity.class" ]; then
+    kv "Gradle Android compile" "PASS (installed SDK; offline)"
+  else
+    kv "Gradle Android compile" "FAIL/BLOCKED (offline build exit $rc)"
+  fi
+}
+
+headless_browser_test() {
+  section "HEADLESS BROWSER TEST"
+  local d browser="" kind="" rc
+  for browser in chromium chromium-browser google-chrome google-chrome-stable firefox; do
+    if have "$browser"; then
+      [ "$browser" = "firefox" ] && kind="firefox" || kind="chromium"
+      break
+    fi
+    browser=""
+  done
+  [ -n "$browser" ] || { kv "headless browser launch" "SKIP: browser absent"; return; }
+  ensure_probe_tmp || { kv "headless browser launch" "BLOCKED: temp directory unavailable"; return; }
+  d="$PROBE_TMP/browser"
+  mkdir -p "$d/profile" || { kv "headless browser launch" "BLOCKED: temp setup failed"; return; }
+  printf '%s\n' '<!doctype html><title>probe</title><p>agent-browser-probe</p>' >"$d/index.html"
+  if [ "$kind" = "firefox" ]; then
+    bounded 30 "$browser" --headless --profile "$d/profile" --screenshot "$d/screenshot.png" "file://$d/index.html" >/dev/null 2>&1
+  else
+    bounded 30 "$browser" --headless --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-background-networking \
+      --user-data-dir="$d/profile" --screenshot="$d/screenshot.png" "file://$d/index.html" >/dev/null 2>&1
+  fi
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -s "$d/screenshot.png" ] && kv "headless browser launch" "PASS ($browser)" || kv "headless browser launch" "FAIL/BLOCKED ($browser exit $rc)"
+}
+
+container_run_test() {
+  section "CONTAINER RUN TEST (LOCAL IMAGE ONLY)"
+  local runtime="" image="" candidate rc out
+  if have docker; then runtime="docker"; elif have podman; then runtime="podman"; fi
+  [ -n "$runtime" ] || { kv "container run" "SKIP: docker/podman absent"; return; }
+
+  for candidate in busybox:latest alpine:latest debian:latest ubuntu:latest; do
+    if bounded 8 "$runtime" image inspect "$candidate" >/dev/null 2>&1; then image="$candidate"; break; fi
+  done
+  [ -n "$image" ] || { kv "container run" "SKIP: no supported local image (pull disabled)"; return; }
+
+  out=$(bounded 30 "$runtime" run --rm --pull=never --network=none --read-only \
+    --entrypoint /bin/sh "$image" -c 'printf agent-container-probe' 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "agent-container-probe" ] && kv "container run" "PASS ($runtime; local image)" || kv "container run" "FAIL/BLOCKED ($runtime exit $rc)"
+}
+
+git_workflow_test() {
+  section "GIT WORKFLOW TEST"
+  local d rc
+  have git || { kv "temporary Git workflow" "SKIP: git absent"; return; }
+  ensure_probe_tmp || { kv "temporary Git workflow" "BLOCKED: temp directory unavailable"; return; }
+  d="$PROBE_TMP/git-workflow"
+  mkdir -p "$d" || { kv "temporary Git workflow" "BLOCKED: temp setup failed"; return; }
+  (
+    cd "$d" || exit 1
+    bounded 10 git init -q . &&
+    printf '%s\n' 'probe-v1' >probe.txt &&
+    bounded 10 git add probe.txt &&
+    bounded 10 git -c user.name='Agent Probe' -c user.email='probe@example.invalid' commit -q -m 'probe commit' &&
+    printf '%s\n' 'probe-v2' >>probe.txt &&
+    ! bounded 10 git diff --quiet -- probe.txt
+  ) >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "temporary Git workflow" "PASS (init/add/commit/diff)" || kv "temporary Git workflow" "FAIL/BLOCKED (exit $rc)"
 }
 
 python_ml_inventory() {
@@ -1172,7 +1368,7 @@ section "PROBE"
 kv "probe version" "$VERSION"
 if have date; then kv "timestamp UTC" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"; fi
 kv "mode" "single standardized run"
-kv "active tests" "temp write, local TCP, gcc compile, rootless namespaces/runtime info, CPU/ML/GPU execution, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
+kv "active tests" "temp write, local TCP, developer builds, Android/Gradle, headless browser, local-image container, Git workflow, rootless namespaces/runtime info, CPU/ML/GPU execution, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
 kv "test packages" "$PY_PACKAGE; $MS_PACKAGE; $ZOD_PACKAGE; apt:hello"
 kv "portable Deno fallback" "v$DENO_VERSION when Deno is absent"
 kv "safety" "bounded tests; temp artifacts; guarded apt install+purge; no secret/private-file inspection"
@@ -1311,7 +1507,7 @@ for x in \
   python python3 pip pip3 uv pipx ipython jupyter pytest cython numba torchrun hf \
   node npm pnpm yarn bun deno corepack npx tsc ts-node \
   go rustc cargo swift swiftc kotlin kotlinc \
-  gcc g++ gfortran clang cmake make ninja meson ant pkg-config autoconf automake \
+  gcc g++ gfortran clang cmake make ninja meson gradle ant pkg-config autoconf automake \
   java javac dotnet ruby php R perl \
   git gh; do
   safe_version "$x"
@@ -1398,6 +1594,11 @@ else
 fi
 
 gcc_compile_test
+developer_build_tests
+android_gradle_test
+headless_browser_test
+container_run_test
+git_workflow_test
 apt_hello_test
 python_package_test
 node_package_test
