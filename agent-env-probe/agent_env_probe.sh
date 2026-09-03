@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # agent_env_probe.sh
 # Standardized environment + capability probe for agentic sandboxes/VMs.
-# One command, zero modes. It performs bounded, controlled active tests in addition
-# to inventory. It intentionally avoids secrets, private file contents, browser
-# profiles/cookies, process command lines, SSH/Git/cloud credentials, cloud metadata,
-# public-IP discovery, port scanning, and sustained stress benchmarks.
+# One command, zero modes. Performs bounded inventory and active capability tests.
+# Avoids secrets, private file contents, browser profiles/cookies, process command
+# lines, SSH/Git/cloud credentials, cloud metadata, public-IP discovery, port
+# scanning, and sustained stress benchmarks.
 
 set -u
 set -o pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 if [ "$#" -ne 0 ]; then
   echo "Usage: ./agent_env_probe.sh" >&2
@@ -36,15 +36,13 @@ DENO_SHA_DARWIN_X86_64="7d4524b82bcc557fe020a1a5b56956ed42b992ae5b28026e8ad5d173
 DENO_SHA_DARWIN_AARCH64="213a2f304f04d3c9cb5220669afad138f60a5aab1fe80962abdeb8f35807a472"
 
 PROBE_TMP=""
+
 have() { command -v "$1" >/dev/null 2>&1; }
 section() { printf '\n===== %s =====\n' "$1"; }
 kv() { printf '%-32s %s\n' "$1:" "$2"; }
 first_line() { "$@" 2>&1 | sed -n '1p' | tr '\t' ' '; }
-trim() { sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 read_file_line() { [ -r "$1" ] && sed -n '1p' "$1" 2>/dev/null || true; }
-yesno() { [ "$1" -eq 0 ] && printf 'yes' || printf 'no'; }
 
-# Conservative redaction for strings that accidentally resemble credentials.
 redact_line() {
   sed -E \
     -e 's/(Bearer|bearer)[[:space:]]+[A-Za-z0-9._~+\/=:-]+/\1 <REDACTED>/g' \
@@ -54,7 +52,6 @@ redact_line() {
 }
 
 safe_version() {
-  # Print only presence + first version line. Never prints PATH.
   local cmd=$1 out=""
   if ! have "$cmd"; then
     printf '%-20s %s\n' "$cmd" "absent"
@@ -62,7 +59,7 @@ safe_version() {
   fi
 
   case "$cmd" in
-    python|python3|pip|pip3|uv|node|npm|pnpm|yarn|bun|deno|rustc|cargo|gcc|g++|clang|cmake|make|ninja|meson|git|gh|docker|podman|buildah|kubectl|helm|terraform|ansible|curl|wget|jq|rg|sqlite3|ffmpeg|pandoc|tesseract|java|javac|dotnet|ruby|php)
+    python|python3|pip|pip3|uv|node|npm|pnpm|yarn|bun|deno|rustc|cargo|gcc|g++|clang|cmake|make|ninja|meson|git|gh|docker|podman|buildah|kubectl|helm|terraform|ansible|curl|wget|jq|rg|sqlite3|ffmpeg|pandoc|tesseract|java|javac|dotnet|ruby|php|swift|swiftc|gfortran|corepack|npx|tsc|ts-node|pipx|ipython|jupyter|pytest|cython|numba|hf|playwright|ant|pkg-config|autoconf|automake|zip|tar|gzip|bzip2|xz|zstd|file|strings|readelf|objdump|nm|lsns|unshare|nsenter|chroot|findmnt|socat|rsync|weasyprint|cairosvg|inkscape|latex|pdflatex|xelatex|lualatex|ffprobe|sox|gpg)
       out=$(first_line "$cmd" --version || true)
       ;;
     go)
@@ -73,6 +70,9 @@ safe_version() {
       ;;
     R)
       out=$(first_line R --version || true)
+      ;;
+    kotlin|kotlinc)
+      out=$(first_line "$cmd" -version || true)
       ;;
     libreoffice|soffice)
       out=$(first_line "$cmd" --version || true)
@@ -86,8 +86,8 @@ safe_version() {
     gs)
       out=$(first_line gs --version || true)
       ;;
-    pdftotext)
-      out=$(pdftotext -v 2>&1 | sed -n '1p' || true)
+    pdftotext|pdfinfo|pdftoppm|pdfimages|pdfunite)
+      out=$(first_line "$cmd" -v || true)
       ;;
     ssh)
       out=$(ssh -V 2>&1 | sed -n '1p' || true)
@@ -104,6 +104,27 @@ safe_version() {
     chromium|chromium-browser|google-chrome|google-chrome-stable|firefox)
       out=$(first_line "$cmd" --version || true)
       ;;
+    unzip)
+      out=$(unzip -v 2>/dev/null | sed -n '1p' || true)
+      ;;
+    capsh)
+      out=$(capsh --help 2>&1 | sed -n '1p' || true)
+      ;;
+    ip)
+      out=$(ip -Version 2>&1 | sed -n '1p' || true)
+      ;;
+    ping)
+      out=$(ping -V 2>&1 | sed -n '1p' || true)
+      ;;
+    dot)
+      out=$(dot -V 2>&1 | sed -n '1p' || true)
+      ;;
+    openssl)
+      out=$(openssl version 2>&1 | sed -n '1p' || true)
+      ;;
+    torchrun|xvfb-run|getcap|nc)
+      out="present"
+      ;;
     *)
       out="present"
       ;;
@@ -115,7 +136,6 @@ safe_version() {
 }
 
 bytes_human() {
-  # Input integer bytes; output compact IEC value. Uses awk only.
   awk -v b="${1:-0}" 'BEGIN {
     split("B KiB MiB GiB TiB",u," "); i=1;
     while (b>=1024 && i<5) { b/=1024; i++ }
@@ -158,7 +178,6 @@ pids_limit_v2() {
   [ -r /sys/fs/cgroup/pids.current ] && kv "cgroup pids.current" "$(read_file_line /sys/fs/cgroup/pids.current)"
 }
 
-
 bounded() {
   local secs=$1
   shift
@@ -178,6 +197,7 @@ cleanup_probe_tmp() {
   esac
 }
 trap cleanup_probe_tmp EXIT
+
 sha256_file() {
   local f=$1
   if have sha256sum; then sha256sum "$f" 2>/dev/null | awk '{print $1}'; return; fi
@@ -225,6 +245,75 @@ run_priv_bounded() {
     sudo) bounded "$secs" sudo -n "$@" ;;
     *) return 126 ;;
   esac
+}
+
+local_socket_test() {
+  section "LOCAL SOCKET TEST"
+  local py="" rc
+  if have python3; then py=$(command -v python3); elif have python; then py=$(command -v python); fi
+  [ -n "$py" ] || { kv "127.0.0.1 TCP bind/connect" "SKIP: Python absent"; return; }
+
+  bounded 8 "$py" -I -c '
+import socket, sys
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+accepted = None
+try:
+    server.settimeout(2)
+    client.settimeout(2)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    client.connect(("127.0.0.1", port))
+    accepted, addr = server.accept()
+    accepted.settimeout(2)
+    client.sendall(b"probe")
+    data = accepted.recv(5)
+    sys.exit(0 if data == b"probe" else 1)
+finally:
+    if accepted is not None:
+        accepted.close()
+    client.close()
+    server.close()
+' >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && kv "127.0.0.1 TCP bind/connect" "PASS (ephemeral port)" || kv "127.0.0.1 TCP bind/connect" "FAIL/BLOCKED (exit $rc)"
+}
+
+gcc_compile_test() {
+  section "GCC COMPILE TEST"
+  local d src bin out rc
+  have gcc || { kv "gcc compile" "SKIP: gcc absent"; return; }
+  ensure_probe_tmp || { kv "gcc temp_dir" "BLOCKED"; return; }
+  d="$PROBE_TMP/gcc"
+  mkdir -p "$d" || { kv "gcc temp_setup" "BLOCKED"; return; }
+  src="$d/probe.c"
+  bin="$d/probe-bin"
+  cat > "$src" <<'EOF_C'
+#include <stdio.h>
+int main(void) {
+  puts("agent-gcc-probe");
+  return 0;
+}
+EOF_C
+
+  bounded 15 gcc -std=c11 -O0 -o "$bin" "$src" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    kv "gcc compile" "FAIL/BLOCKED (exit $rc)"
+    rm -f "$src" "$bin" 2>/dev/null || true
+    return
+  fi
+  kv "gcc compile" "PASS"
+
+  out=$(bounded 5 "$bin" 2>/dev/null | sed -n '1p' || true)
+  [ "$out" = "agent-gcc-probe" ] && kv "gcc binary execution" "PASS" || kv "gcc binary execution" "FAIL"
+  rm -f "$src" "$bin" 2>/dev/null || true
+  if [ ! -e "$src" ] && [ ! -e "$bin" ]; then
+    kv "gcc test cleanup" "PASS"
+  else
+    kv "gcc test cleanup" "FAIL"
+  fi
 }
 
 python_package_test() {
@@ -317,11 +406,11 @@ node_package_test() {
   rc=$?
   [ "$rc" -eq 0 ] && kv "node.CommonJS ms" "PASS" || kv "node.CommonJS ms" "FAIL (exit $rc)"
 
-  cat > "$d/app/zod-test.mjs" <<'EOF'
+  cat > "$d/app/zod-test.mjs" <<'EOF_ZOD'
 import { z } from "zod";
 const result = z.number().int().safeParse(42);
 if (!result.success || result.data !== 42) process.exit(1);
-EOF
+EOF_ZOD
   (cd "$d/app" && env -i PATH="$minpath" HOME="$d/home" LANG=C "$node_bin" ./zod-test.mjs >/dev/null 2>&1)
   rc=$?
   [ "$rc" -eq 0 ] && kv "node.ESM zod" "PASS" || kv "node.ESM zod" "FAIL (exit $rc)"
@@ -404,7 +493,7 @@ deno_test() {
 
 apt_hello_test() {
   section "APT SYSTEM PACKAGE TEST"
-  local mode before=0 sim inst_bad rc hello_out after=0
+  local mode before=0 inst_bad rc hello_out after=0
   have apt-get || { kv "apt.present" "SKIP: apt-get absent"; return; }
   have dpkg-query || { kv "apt.dpkg_query" "SKIP: dpkg-query absent"; return; }
   ensure_probe_tmp || { kv "apt.temp_dir" "BLOCKED"; return; }
@@ -469,8 +558,6 @@ apt_hello_test() {
   hello_out=$(LC_ALL=C hello 2>/dev/null | sed -n '1p' || true)
   [ "$after" -eq 1 ] && [ "$hello_out" = "Hello, world!" ] && kv "apt.hello_execution" "PASS" || kv "apt.hello_execution" "FAIL"
 
-  # We only purge if this probe installed hello. We deliberately do not run autoremove,
-  # apt-get update, apt-get clean, or touch unrelated packages/caches.
   run_priv_bounded 60 "$mode" env DEBIAN_FRONTEND=noninteractive LC_ALL=C \
     apt-get -y -o Acquire::Retries=0 -o Dpkg::Use-Pty=0 purge hello >/dev/null 2>&1
   rc=$?
@@ -481,18 +568,18 @@ apt_hello_test() {
   fi
   kv "apt.cleanup_scope" "package removed; apt logs/cache metadata may remain changed"
 }
+
 section "PROBE"
 kv "probe version" "$VERSION"
 if have date; then kv "timestamp UTC" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"; fi
 kv "mode" "single standardized run"
-kv "active tests" "temp write, outbound HTTPS/DNS, sudo capability, apt hello, Python package, npm packages, Deno/npm"
+kv "active tests" "temp write, local TCP, gcc compile, outbound HTTPS/DNS, sudo, apt hello, Python/npm/Deno packages"
 kv "test packages" "$PY_PACKAGE; $MS_PACKAGE; $ZOD_PACKAGE; apt:hello"
 kv "portable Deno fallback" "v$DENO_VERSION when Deno is absent"
-kv "safety" "bounded tests; temp user-space installs; guarded apt install+purge; no secret/private-file inspection"
+kv "safety" "bounded tests; temp artifacts; guarded apt install+purge; no secret/private-file inspection"
 
 section "OS / KERNEL"
 if [ -r /etc/os-release ]; then
-  # Allowlist only non-sensitive OS fields.
   . /etc/os-release
   kv "OS" "${PRETTY_NAME:-${NAME:-unknown}}"
   kv "OS ID" "${ID:-unknown}"
@@ -536,7 +623,6 @@ else
   kv "lscpu" "unavailable"
 fi
 cpu_quota_v2
-# cgroup v1 fallback
 if [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then
   q=$(read_file_line /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(read_file_line /sys/fs/cgroup/cpu/cpu.cfs_period_us)
   kv "cgroup v1 CPU quota" "$q / $p us"
@@ -564,7 +650,6 @@ for p in / /workspace /mnt/data /tmp; do
   if [ -e "$p" ]; then
     kv "path present: $p" "yes"
     if df -P -k "$p" >/dev/null 2>&1; then
-      # Stable, compact capacity line. No source-device field, avoiding host identifiers.
       df -P -k "$p" 2>/dev/null | awk -v p="$p" 'NR==2 {printf "%-32s total=%s KiB used=%s KiB avail=%s KiB use=%s\n", ("capacity " p ":"), $2,$3,$4,$5}'
     fi
     if df -P -i "$p" >/dev/null 2>&1; then
@@ -578,7 +663,6 @@ for p in / /workspace /mnt/data /tmp; do
 done
 
 section "PROCESS / RESOURCE LIMITS"
-# ulimit values are shell-level resource limits and reveal no command lines or secrets.
 ( ulimit -a 2>/dev/null || true ) | sed 's/^/  /'
 pids_limit_v2
 
@@ -605,7 +689,6 @@ ng=$(find /dev -maxdepth 1 -name 'nvidia*' -print 2>/dev/null | wc -l | tr -d ' 
 kv "NVIDIA device nodes" "${ng:-0}"
 if have nvidia-smi; then
   kv "nvidia-smi" "present"
-  # Read-only query; no utilization loop.
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | sed 's/^/  GPU: /' | head -n 8
 else
   kv "nvidia-smi" "absent"
@@ -619,24 +702,38 @@ fi
 
 section "DEVELOPMENT TOOLCHAIN"
 for x in \
-  python python3 pip pip3 uv \
-  node npm pnpm yarn bun deno \
-  go rustc cargo \
-  gcc g++ clang cmake make ninja meson \
+  python python3 pip pip3 uv pipx ipython jupyter pytest cython numba torchrun hf \
+  node npm pnpm yarn bun deno corepack npx tsc ts-node \
+  go rustc cargo swift swiftc kotlin kotlinc \
+  gcc g++ gfortran clang cmake make ninja meson ant pkg-config autoconf automake \
   java javac dotnet ruby php R perl \
   git gh; do
   safe_version "$x"
 done
 
-section "INFRA / CONTAINER TOOLS"
-for x in docker podman buildah kubectl helm terraform ansible; do safe_version "$x"; done
+section "INFRA / CONTAINER / ISOLATION TOOLS"
+for x in docker podman buildah kubectl helm terraform ansible lsns unshare nsenter capsh getcap chroot findmnt; do safe_version "$x"; done
+
+section "ARCHIVE / BINARY TOOLS"
+for x in zip unzip tar gzip bzip2 xz zstd file strings readelf objdump nm; do safe_version "$x"; done
 
 section "DATA / NETWORK CLIENTS"
-for x in curl wget jq rg sqlite3 psql mysql redis-cli ssh; do safe_version "$x"; done
+for x in curl wget jq rg sqlite3 psql mysql redis-cli ssh ip ping nc socat rsync; do safe_version "$x"; done
 
 section "BROWSER / DOCUMENT / MEDIA TOOLS"
-for x in chromium chromium-browser google-chrome google-chrome-stable firefox libreoffice soffice pandoc ffmpeg convert magick tesseract pdftotext gs; do safe_version "$x"; done
+for x in \
+  chromium chromium-browser google-chrome google-chrome-stable firefox playwright xvfb-run \
+  libreoffice soffice pandoc \
+  ffmpeg ffprobe sox \
+  convert magick tesseract \
+  pdftotext pdfinfo pdftoppm pdfimages pdfunite gs \
+  weasyprint cairosvg dot inkscape \
+  latex pdflatex xelatex lualatex; do
+  safe_version "$x"
+done
 
+section "CRYPTO / SIGNING TOOLS"
+for x in openssl gpg; do safe_version "$x"; done
 
 section "PRIVILEGE SURFACE"
 uid=$(id -u 2>/dev/null || echo unknown)
@@ -659,6 +756,7 @@ if have ss; then
 else
   kv "socket listener inventory" "ss unavailable"
 fi
+local_socket_test
 
 section "OUTBOUND NETWORK TEST"
 if have getent; then
@@ -689,6 +787,7 @@ else
   kv "temporary directory" "BLOCKED: /tmp unavailable/not writable"
 fi
 
+gcc_compile_test
 apt_hello_test
 python_package_test
 node_package_test
